@@ -1,16 +1,14 @@
 """On-device RAG testbed -- phase 0 spike.
 
-One file, hardcoded config. All seven stage functions exist with their real
-names and contracts; stages 3-7 are unimplemented stubs so that filling them in
-is addition, not signature change.
-
-Implemented so far:
+One file, hardcoded config. All seven stages are implemented, and stage 7 is a
+human loop rather than an API call:
   stage 1  build_index / chunk_document
   stage 2  rewrite_query
   stage 3  retrieve
   stage 4  rerank
   stage 5  build_context
   stage 6  assemble_prompt
+  stage 7  deliver_prompt / run_generation_loop / assemble_judge_prompt
 
 Retrieval is local and generation is manual: nothing in this file may ever call
 a generation API.
@@ -23,6 +21,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import sys
@@ -94,6 +93,10 @@ class Config:
     prompt_question_position: str = "last"   # first | last | both
     prompt_show_scores: bool = False
     prompt_metadata: str = "source"      # none | source | full
+
+    clipboard: bool = True               # falls back to files when unavailable
+    judge_template: str = "v0"
+    judge_scale: tuple[int, ...] = (0, 1, 2)
 
     index_root: str = "indexes"
     runs_root: str = "runs"
@@ -1164,14 +1167,336 @@ def assemble_prompt(query: str, context: Context, cfg: Config = CFG,
 
 
 # --------------------------------------------------------------------------
-# stage 7: manual generation, not written yet
+# the whole pipeline, stages 2-6
 # --------------------------------------------------------------------------
 
-def deliver_prompt(bundle: PromptBundle, cfg: Config = CFG) -> None:
-    """Clipboard + status line. Never calls a generation API; nothing here ever will."""
-    raise NotImplementedError("stage 7: manual generation loop")
+def run_pipeline(query: str, index: Index, cfg: Config = CFG,
+                 query_id: Optional[str] = None
+                 ) -> tuple[PromptBundle, Context, list[Candidate], dict]:
+    timing = {}
+    t = time.time()
+    rewrites = rewrite_query(query, cfg)
+    timing["rewrite_ms"] = round((time.time() - t) * 1000, 1)
+    t = time.time()
+    candidates = retrieve(rewrites, index, cfg)
+    timing["retrieve_ms"] = round((time.time() - t) * 1000, 1)
+    t = time.time()
+    candidates = rerank(query, rewrites, candidates, index, cfg)
+    timing["rerank_ms"] = round((time.time() - t) * 1000, 1)
+    t = time.time()
+    context = build_context(candidates, index, cfg)
+    timing["context_ms"] = round((time.time() - t) * 1000, 1)
+    t = time.time()
+    bundle = assemble_prompt(query, context, cfg, query_id=query_id)
+    timing["prompt_ms"] = round((time.time() - t) * 1000, 1)
+    return bundle, context, candidates, timing
 
 
+# --------------------------------------------------------------------------
+# stage 7: manual generation
+# --------------------------------------------------------------------------
+# Nothing here may call a generation API, and nothing ever will: the manual step
+# is the architecture. This tool puts a prompt on the clipboard, a human pastes
+# it into a frontier model, copies the answer back and presses Enter.
+#
+# Generation is strictly one query at a time. Several queries' contexts in one
+# prompt would let the model answer query 7 from chunks retrieved for query 3,
+# which inflates scores unpredictably. Judging is the opposite: one batched
+# paste for every triple, from a versioned template, with nothing in it that
+# identifies which config produced which answer.
+
+def _clipboard() -> tuple[Optional[Callable[[str], None]], Optional[Callable[[], str]]]:
+    """(copy, paste), or (None, None) when there is no usable clipboard."""
+    try:
+        import pyperclip
+        pyperclip.paste()          # imports fine with no backend; this is the real probe
+    except Exception:
+        return None, None
+    return pyperclip.copy, pyperclip.paste
+
+
+def deliver_prompt(bundle: PromptBundle, cfg: Config = CFG,
+                   out_dir: Optional[Path] = None) -> str:
+    """Put the prompt where a human can paste it. Returns where it went."""
+    copy, _ = _clipboard() if cfg.clipboard else (None, None)
+    if copy is not None:
+        copy(bundle.text)
+        return "clipboard"
+    path = Path(out_dir or ".") / "prompts" / f"{bundle.query_id}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(bundle.text, encoding="utf-8")
+    return str(path)
+
+
+def collect_answer(bundle: PromptBundle, cfg: Config = CFG,
+                   out_dir: Optional[Path] = None) -> Optional[str]:
+    """Read the human's answer back. Returns None if there is nothing to read."""
+    _, paste = _clipboard() if cfg.clipboard else (None, None)
+    if paste is not None:
+        return paste()
+    path = Path(out_dir or ".") / "answers" / f"{bundle.query_id}.txt"
+    return path.read_text(encoding="utf-8") if path.exists() else None
+
+
+@dataclass(frozen=True)
+class QueryEntry:
+    query_id: str
+    query: str
+    ground_truth: Optional[str] = None
+
+
+def load_queries(path: str) -> list[QueryEntry]:
+    """One query per line. Optionally `id<TAB>query` or `id<TAB>query<TAB>ground truth`."""
+    entries: list[QueryEntry] = []
+    seen: set[str] = set()
+    for n, raw in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) == 1:
+            qid, query, truth = hashlib.sha256(line.encode()).hexdigest()[:8], parts[0], None
+        else:
+            qid, query = parts[0].strip(), parts[1].strip()
+            truth = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+        if qid in seen:
+            raise SystemExit(f"{path}:{n}: duplicate query_id {qid!r}")
+        seen.add(qid)
+        entries.append(QueryEntry(qid, query, truth))
+    if not entries:
+        raise SystemExit(f"no queries in {path}")
+    return entries
+
+
+def _append_jsonl(path: Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())      # answers are expensive to produce; do not lose them
+
+
+def _latest_by(rows: list[dict], key: str) -> list[dict]:
+    """per_query.jsonl is append-only, so a retried query has more than one row;
+    the last one is the authoritative record for that query."""
+    out: dict[str, dict] = {}
+    for row in rows:
+        out[row[key]] = row
+    return list(out.values())
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def open_run(cfg: Config = CFG, run: Optional[str] = None) -> Path:
+    """Runs are directories, not database rows."""
+    if run:
+        path = Path(run)
+        if not path.is_dir():
+            raise SystemExit(f"no run directory at {path}")
+        return path
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base = Path(cfg.runs_root) / f"{stamp}-{config_hash(cfg)[:8]}"
+    path, n = base, 1
+    while path.exists():        # two runs in the same second must not share a directory
+        n += 1
+        path = base.with_name(f"{base.name}-{n}")
+    path.mkdir(parents=True)
+    (path / "config.json").write_text(
+        json.dumps(dataclasses.asdict(cfg), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def _peak_rss_mb() -> float:
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return round(peak / (1024 * 1024 if sys.platform == "darwin" else 1024), 1)
+
+
+def _write_timing(run_dir: Path, rows: list[dict]) -> None:
+    rows = _latest_by(rows, "query_id")
+    stages = ["rewrite_ms", "retrieve_ms", "rerank_ms", "context_ms", "prompt_ms"]
+    out: dict = {"n_queries": len(rows), "peak_rss_mb": _peak_rss_mb()}
+    for stage in stages:
+        vals = [r["timing"][stage] for r in rows if "timing" in r]
+        if vals:
+            out[stage] = {"p50": round(float(np.percentile(vals, 50)), 1),
+                          "p95": round(float(np.percentile(vals, 95)), 1)}
+    (run_dir / "timing.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+
+
+def run_generation_loop(entries: list[QueryEntry], index: Index, run_dir: Path,
+                        cfg: Config = CFG) -> None:
+    """One query at a time. Never batch this."""
+    answers = {r["query_id"]: r for r in _read_jsonl(run_dir / "answers.jsonl")}
+    per_query = _read_jsonl(run_dir / "per_query.jsonl")
+    todo = [e for e in entries if e.query_id not in answers]
+    if not todo:
+        print(f"all {len(entries)} queries already answered in {run_dir}")
+        return
+    print(f"{len(todo)} of {len(entries)} queries to go in {run_dir}\n"
+          f"paste the prompt into your model, copy the answer, then press Enter "
+          f"(s = skip, q = quit)\n")
+
+    last_answer = None
+    for n, entry in enumerate(todo, 1):
+        bundle, context, candidates, timing = run_pipeline(entry.query, index, cfg,
+                                                           query_id=entry.query_id)
+        row = {
+            "query_id": entry.query_id,
+            "query": entry.query,
+            "index_hash": bundle.index_hash,
+            "config_hash": bundle.config_hash,
+            "prompt_tokens": bundle.n_tokens,
+            "context_tokens": context.total_tokens,
+            "candidates": [dataclasses.asdict(c) for c in candidates],
+            "blocks": [{"block_id": b.block_id, "doc_id": b.doc_id,
+                        "start_char": b.start_char, "end_char": b.end_char,
+                        "chunk_ids": b.chunk_ids, "scores": b.scores}
+                       for b in context.blocks],
+            "dropped": context.dropped,
+            "timing": timing,
+        }
+        _append_jsonl(run_dir / "per_query.jsonl", row)
+        per_query.append(row)
+
+        sink = deliver_prompt(bundle, cfg, run_dir)
+        print(f"[{n}/{len(todo)}] {entry.query_id}  {entry.query[:60]!r}  "
+              f"{len(context.blocks)} blocks, {bundle.n_tokens} tokens -> {sink}")
+        if sink != "clipboard":
+            print(f"  no clipboard: save the answer to "
+                  f"{run_dir / 'answers' / (entry.query_id + '.txt')}")
+
+        while True:
+            try:
+                key = input("  answer ready? [Enter/s/q] ").strip().lower()
+            except EOFError:
+                key = "q"
+            if key == "q":
+                _write_timing(run_dir, per_query)
+                print(f"stopped; resume with: python rag.py walk <queries> --run {run_dir}")
+                return
+            if key == "s":
+                break
+            answer = collect_answer(bundle, cfg, run_dir)
+            if not answer or not answer.strip():
+                print("  nothing to read; copy the answer first (or s to skip)")
+                continue
+            # the two ways a human silently poisons an eval set
+            if answer.strip() == bundle.text.strip():
+                print("  that is the prompt, not an answer; copy the model's reply")
+                continue
+            if last_answer is not None and answer.strip() == last_answer:
+                print("  identical to the previous answer; press Enter again to keep it")
+                last_answer = None
+                continue
+            _append_jsonl(run_dir / "answers.jsonl", {
+                "query_id": entry.query_id,
+                "answer": answer.strip(),
+                "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
+            last_answer = answer.strip()
+            break
+
+    _write_timing(run_dir, per_query)
+    print(f"\ndone: {run_dir}/answers.jsonl")
+
+
+# --- batched judging -------------------------------------------------------
+
+def _judge_v0(items: list[dict], cfg: Config) -> str:
+    """Versioned in the repo so scores are comparable across runs. No config,
+    no retrieval scores, no hint about which answer came from where."""
+    head = (
+        "You are grading answers to questions about a document collection.\n\n"
+        "For each item you get the question, a reference answer, and a candidate "
+        "answer. Score the candidate against the reference:\n\n"
+        "  2 - correct: carries the reference answer's substance, contradicts nothing\n"
+        "  1 - partial: some of the reference answer, or correct but incomplete\n"
+        "  0 - wrong: contradicts the reference, or does not answer the question\n\n"
+        "A candidate that says the information was not available scores 0 unless "
+        "the reference says so too. Judge content only: ignore length, style, "
+        "formatting and citations. Items are unrelated to each other; do not let "
+        "one item's answer inform another's score.\n\n"
+        "Return only JSON, one object per item, no prose around it:\n"
+        '[{"item": 1, "score": 2, "note": "<= 12 words"}]\n'
+    )
+    body = []
+    for it in items:
+        body.append(
+            f"<item n=\"{it['item']}\">\n"
+            f"<question>\n{it['query']}\n</question>\n"
+            f"<reference>\n{it['reference']}\n</reference>\n"
+            f"<candidate>\n{it['candidate']}\n</candidate>\n"
+            f"</item>"
+        )
+    return head + "\n" + "\n\n".join(body) + "\n"
+
+
+JUDGE_TEMPLATES: dict[str, Callable[[list[dict], Config], str]] = {
+    "v0": _judge_v0,
+}
+
+
+def assemble_judge_prompt(items: list[dict], cfg: Config = CFG) -> str:
+    if cfg.judge_template not in JUDGE_TEMPLATES:
+        raise SystemExit(f"unknown judge.template {cfg.judge_template!r}; "
+                         f"known: {sorted(JUDGE_TEMPLATES)}")
+    return JUDGE_TEMPLATES[cfg.judge_template](items, cfg)
+
+
+def build_judge_items(entries: list[QueryEntry], run_dir: Path,
+                      cfg: Config = CFG) -> tuple[list[dict], list[str]]:
+    """Returns (items, query_ids_in_item_order). Order is shuffled: presentation
+    position would otherwise identify a config across runs judged in one session."""
+    answers = {r["query_id"]: r["answer"] for r in _read_jsonl(run_dir / "answers.jsonl")}
+    usable = [e for e in entries if e.query_id in answers and e.ground_truth]
+    missing_answer = [e.query_id for e in entries if e.query_id not in answers]
+    missing_truth = [e.query_id for e in entries
+                     if e.query_id in answers and not e.ground_truth]
+    if missing_answer:
+        print(f"skipping {len(missing_answer)} queries with no answer yet", file=sys.stderr)
+    if missing_truth:
+        print(f"skipping {len(missing_truth)} answered queries with no ground truth "
+              f"(add a third tab-separated column)", file=sys.stderr)
+    if not usable:
+        raise SystemExit("nothing to judge: need answers and ground truths")
+
+    order = list(usable)
+    random.Random(f"{run_dir.name}:{cfg.judge_template}").shuffle(order)
+    items = [{"item": i, "query": e.query, "reference": e.ground_truth,
+              "candidate": answers[e.query_id]} for i, e in enumerate(order, 1)]
+    return items, [e.query_id for e in order]
+
+
+def parse_judgements(text: str, n_items: int, cfg: Config = CFG) -> dict[int, dict]:
+    """Tolerates markdown fences and prose around the JSON array."""
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end <= start:
+        raise SystemExit("no JSON array found in the pasted text")
+    try:
+        rows = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"pasted text is not valid JSON: {e}")
+
+    out: dict[int, dict] = {}
+    for row in rows:
+        try:
+            item, score = int(row["item"]), int(row["score"])
+        except (KeyError, TypeError, ValueError):
+            raise SystemExit(f"malformed judgement row: {row!r}")
+        if not 1 <= item <= n_items:
+            raise SystemExit(f"judgement for item {item}, but there are {n_items} items")
+        if score not in cfg.judge_scale:
+            raise SystemExit(f"item {item}: score {score} is outside {list(cfg.judge_scale)}")
+        out[item] = {"score": score, "note": str(row.get("note", ""))[:200]}
+    return out
+
+
+# --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
 # cli
 # --------------------------------------------------------------------------
@@ -1231,30 +1556,11 @@ def _cmd_inspect(args) -> None:
         print(f"{'':>27}  {preview!r}")
 
 
-def _pipeline(query: str, index: Index) -> tuple[PromptBundle, Context, list[Candidate], dict]:
-    timing = {}
-    t = time.time()
-    rewrites = rewrite_query(query, CFG)
-    timing["rewrite_ms"] = round((time.time() - t) * 1000, 1)
-    t = time.time()
-    candidates = retrieve(rewrites, index, CFG)
-    timing["retrieve_ms"] = round((time.time() - t) * 1000, 1)
-    t = time.time()
-    candidates = rerank(query, rewrites, candidates, index, CFG)
-    timing["rerank_ms"] = round((time.time() - t) * 1000, 1)
-    t = time.time()
-    context = build_context(candidates, index, CFG)
-    timing["context_ms"] = round((time.time() - t) * 1000, 1)
-    t = time.time()
-    bundle = assemble_prompt(query, context, CFG)
-    timing["prompt_ms"] = round((time.time() - t) * 1000, 1)
-    return bundle, context, candidates, timing
-
-
 def _cmd_query(args) -> None:
     index = load_index(CFG)
-    bundle, context, candidates, timing = _pipeline(args.query, index)
+    bundle, context, candidates, timing = run_pipeline(args.query, index, CFG)
     print(bundle.text)                      # stdout is the prompt and nothing else
+    sink = deliver_prompt(bundle, CFG, Path(CFG.runs_root))
     reasons: dict[str, int] = {}
     for _, why in context.dropped:
         reasons[why] = reasons.get(why, 0) + 1
@@ -1262,7 +1568,75 @@ def _cmd_query(args) -> None:
           f"| {context.total_tokens} context tokens, {bundle.n_tokens} prompt tokens "
           f"(budget {CFG.context_budget_tokens}) | dropped {reasons or '{}'} | "
           f"{' '.join(f'{k}={v}' for k, v in timing.items())} | index {bundle.index_hash[:12]} "
-          f"| config {bundle.config_hash[:12]}", file=sys.stderr)
+          f"| config {bundle.config_hash[:12]} | -> {sink}", file=sys.stderr)
+
+
+def _cmd_walk(args) -> None:
+    cfg = dataclasses.replace(CFG, clipboard=not args.no_clipboard)
+    entries = load_queries(args.queries)
+    index = load_index(cfg)
+    if not args.run:
+        # answers are expensive; do not let a forgotten --run quietly restart one
+        prior = sorted(Path(cfg.runs_root).glob(f"*-{config_hash(cfg)[:8]}*"))
+        prior = [d for d in prior if (d / "answers.jsonl").exists()]
+        if prior:
+            n = len(_read_jsonl(prior[-1] / "answers.jsonl"))
+            print(f"note: {prior[-1]} already holds {n} answers for this exact config; "
+                  f"pass --run {prior[-1]} to continue it instead of starting over\n")
+    run_dir = open_run(cfg, args.run)
+    run_generation_loop(entries, index, run_dir, cfg)
+
+
+def _cmd_judge(args) -> None:
+    cfg = dataclasses.replace(CFG, clipboard=not args.no_clipboard)
+    entries = load_queries(args.queries)
+    run_dir = open_run(cfg, args.run)
+    items, query_ids = build_judge_items(entries, run_dir, cfg)
+    text = assemble_judge_prompt(items, cfg)
+
+    (run_dir / "judge_prompt.txt").write_text(text, encoding="utf-8")
+    (run_dir / "judge_items.json").write_text(
+        json.dumps({"template": cfg.judge_template, "order": query_ids}, indent=2) + "\n",
+        encoding="utf-8")
+    copy, paste = _clipboard() if cfg.clipboard else (None, None)
+    if copy is not None:
+        copy(text)
+    print(f"{len(items)} triples -> {'clipboard' if copy else run_dir / 'judge_prompt.txt'}\n"
+          f"paste into a FRESH session, then copy the JSON back")
+
+    try:
+        input("  scores copied? [Enter] ")
+    except EOFError:
+        return
+    raw = paste() if paste is not None else None
+    if raw is None:
+        path = run_dir / "judge_response.txt"
+        if not path.exists():
+            raise SystemExit(f"no clipboard; save the response to {path} and re-run")
+        raw = path.read_text(encoding="utf-8")
+
+    scored = parse_judgements(raw, len(items), cfg)
+    rows = [{"query_id": query_ids[i - 1], **scored[i]} for i in sorted(scored)]
+    values = [r["score"] for r in rows]
+    dist = {str(v): values.count(v) for v in sorted(set(values))}
+    out = {
+        "judge_template": cfg.judge_template,
+        "config_hash": config_hash(cfg),
+        "n_items": len(items),
+        "n_scored": len(rows),
+        "mean": round(sum(values) / len(values), 3) if values else None,
+        "distribution": dist,
+        "scores": rows,
+    }
+    (run_dir / "judgements.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+    missing = sorted(set(range(1, len(items) + 1)) - set(scored))
+    if missing:
+        print(f"WARNING no score for items {missing}", file=sys.stderr)
+    print(f"mean {out['mean']} over {len(rows)} items, distribution {dist} "
+          f"-> {run_dir / 'judgements.json'}")
+    if len(rows) < 30:
+        print("note: below ~30 items, differences under ~10 points are noise",
+              file=sys.stderr)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -1285,6 +1659,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_q = sub.add_parser("query", help="full pipeline; the prompt goes to stdout")
     p_q.add_argument("query")
     p_q.set_defaults(func=_cmd_query)
+
+    p_w = sub.add_parser("walk", help="one query at a time: prompt out, answer back in")
+    p_w.add_argument("queries", help="one query per line, or id<TAB>query[<TAB>ground truth]")
+    p_w.add_argument("--run", help="resume an existing run directory")
+    p_w.add_argument("--no-clipboard", action="store_true", help="use files instead")
+    p_w.set_defaults(func=_cmd_walk)
+
+    p_j = sub.add_parser("judge", help="one batched judge prompt for every collected answer")
+    p_j.add_argument("queries")
+    p_j.add_argument("--run", required=True, help="the run directory holding answers.jsonl")
+    p_j.add_argument("--no-clipboard", action="store_true")
+    p_j.set_defaults(func=_cmd_judge)
 
     args = ap.parse_args(argv)
     args.func(args)
