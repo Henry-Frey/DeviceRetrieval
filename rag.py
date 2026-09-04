@@ -47,7 +47,10 @@ class Config:
     corpus_globs: tuple[str, ...] = ("**/*.md", "**/*.txt")
 
     chunk_strategy: str = "recursive"
-    chunk_size: int = 512            # tokens, counted by the embedder's tokenizer
+    # tokens, counted by the embedder's tokenizer. 510 = bge's 512-token limit
+    # minus its two special tokens, so a full-size chunk is not truncated at
+    # embed time. Raise this only alongside a model with a longer context.
+    chunk_size: int = 510
     chunk_overlap: int = 51          # tokens, 10%
     chunk_separators: tuple[str, ...] = ("\n\n", "\n", ". ", " ")
     chunk_header_mode: str = "none"
