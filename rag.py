@@ -9,6 +9,8 @@ Implemented so far:
   stage 2  rewrite_query
   stage 3  retrieve
   stage 4  rerank
+  stage 5  build_context
+  stage 6  assemble_prompt
 
 Retrieval is local and generation is manual: nothing in this file may ever call
 a generation API.
@@ -80,14 +82,18 @@ class Config:
 
     context_top_n: int = 8
     context_budget_tokens: int = 6000
-    context_neighbours: int = 0
-    context_dedup: str = "exact"
-    context_order: str = "score_desc"
+    context_neighbours: int = 0          # +/- chunks by ordinal, same document
+    context_dedup: str = "exact"         # off | exact
+    context_mmr: str = "off"             # off | mmr
+    context_mmr_lambda: float = 0.7      # 1.0 is pure relevance
+    context_mmr_pool: int = 50           # candidates MMR chooses among
+    context_order: str = "score_desc"    # score_desc | doc_order | inverted_v
 
     prompt_template: str = "v0"
-    prompt_delimiters: str = "xml"
-    prompt_question_position: str = "last"
+    prompt_delimiters: str = "xml"       # xml | markdown | plain
+    prompt_question_position: str = "last"   # first | last | both
     prompt_show_scores: bool = False
+    prompt_metadata: str = "source"      # none | source | full
 
     index_root: str = "indexes"
     runs_root: str = "runs"
@@ -168,6 +174,7 @@ class Context:
     blocks: list[ContextBlock]
     total_tokens: int
     dropped: list[tuple[str, str]]   # (chunk_id, reason)
+    index_hash: str = ""             # so stage 6 never needs the index itself
 
 
 @dataclass
@@ -530,6 +537,12 @@ def index_identity(cfg: Config, fingerprint: str) -> tuple[str, dict]:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest(), payload
 
 
+def config_hash(cfg: Config) -> str:
+    """Identifies a whole run. Unlike the index hash this covers query-time keys too."""
+    blob = json.dumps(dataclasses.asdict(cfg), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class Index:
     path: Path
@@ -538,9 +551,15 @@ class Index:
     chunks: list[Chunk]
     matrix: np.ndarray                 # [n_chunks, dim], L2-normalised, row i <-> chunks[i]
     _by_id: dict[str, int] = dataclasses.field(default_factory=dict)
+    _by_doc: dict[str, list[Chunk]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         self._by_id = {c.chunk_id: i for i, c in enumerate(self.chunks)}
+        self._by_doc = {}
+        for c in self.chunks:
+            self._by_doc.setdefault(c.doc_id, []).append(c)
+        for cs in self._by_doc.values():
+            cs.sort(key=lambda c: c.ordinal)
 
     @property
     def index_hash(self) -> str:
@@ -554,6 +573,9 @@ class Index:
 
     def row_of(self, chunk_id: str) -> int:
         return self._by_id[chunk_id]
+
+    def doc_chunks(self, doc_id: str) -> list[Chunk]:
+        return self._by_doc[doc_id]
 
 
 def _write_jsonl(path: Path, rows: Iterator[dict]) -> None:
@@ -884,16 +906,266 @@ def rerank(query: str, rewrites: list[Rewrite], candidates: list[Candidate],
 
 
 # --------------------------------------------------------------------------
-# stages 5-7: names and signatures locked, bodies not written yet
+# stage 5: context construction
 # --------------------------------------------------------------------------
+# Chunks overlap by design, so selected chunks are merged into contiguous
+# spans before anything is measured or rendered. A block's text stays exactly
+# Document.text[start_char:end_char], which is what keeps answer-span
+# containment a span-arithmetic question rather than a string search.
+
+def _relevance(c: Candidate) -> float:
+    return c.rerank_score if c.rerank_score is not None else (c.dense_score or 0.0)
+
+
+def _scores_of(c: Candidate) -> dict[str, Optional[float]]:
+    return {"dense": c.dense_score, "bm25": c.bm25_score,
+            "rrf": c.rrf_score, "rerank": c.rerank_score}
+
+
+def _best_scores(a: dict, b: dict) -> dict:
+    return {k: (a[k] if b[k] is None else b[k] if a[k] is None else max(a[k], b[k])) for k in a}
+
+
+def _dedup(candidates: list[Candidate], index: Index, cfg: Config,
+           dropped: list[tuple[str, str]]) -> list[Candidate]:
+    if cfg.context_dedup == "off":
+        return list(candidates)
+    if cfg.context_dedup != "exact":
+        raise SystemExit(f"unknown context.dedup {cfg.context_dedup!r}; known: ['off', 'exact']")
+    seen: set[str] = set()
+    out: list[Candidate] = []
+    for c in candidates:
+        key = " ".join(index.get_chunk(c.chunk_id).text.split()).casefold()
+        if key in seen:
+            dropped.append((c.chunk_id, "dedup"))
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def _select_head(candidates: list[Candidate], index: Index, cfg: Config) -> list[Candidate]:
+    return candidates[:cfg.context_top_n]
+
+
+def _select_mmr(candidates: list[Candidate], index: Index, cfg: Config) -> list[Candidate]:
+    """Maximal marginal relevance over the candidate pool."""
+    pool = candidates[:max(cfg.context_mmr_pool, cfg.context_top_n)]
+    if not pool:
+        return []
+    rel = np.array([_relevance(c) for c in pool], dtype=np.float32)
+    lo, hi = float(rel.min()), float(rel.max())
+    # min-max first: a cross-encoder logit and a cosine similarity are not on the
+    # same scale, and mixing them raw would make lambda meaningless
+    rel = (rel - lo) / (hi - lo) if hi > lo else np.ones_like(rel)
+    vecs = np.asarray([index.matrix[index.row_of(c.chunk_id)] for c in pool], dtype=np.float32)
+    sim = vecs @ vecs.T
+    lam = cfg.context_mmr_lambda
+
+    chosen: list[int] = []
+    remaining = list(range(len(pool)))
+    while remaining and len(chosen) < cfg.context_top_n:
+        if not chosen:
+            best = max(remaining, key=lambda i: rel[i])
+        else:
+            best = max(remaining,
+                       key=lambda i: lam * rel[i] - (1 - lam) * max(sim[i][j] for j in chosen))
+        chosen.append(best)
+        remaining.remove(best)
+    return [pool[i] for i in chosen]
+
+
+SELECTORS: dict[str, Callable[[list[Candidate], Index, Config], list[Candidate]]] = {
+    "off": _select_head,
+    "mmr": _select_mmr,
+}
+
+
+def _expand(selected: list[Candidate], index: Index, cfg: Config) -> list[dict]:
+    """One span group per selected candidate, widened by neighbour expansion."""
+    groups = []
+    for priority, c in enumerate(selected):
+        chunk = index.get_chunk(c.chunk_id)
+        members = [chunk]
+        if cfg.context_neighbours > 0:
+            siblings = index.doc_chunks(c.doc_id)      # sorted by ordinal
+            lo = max(0, chunk.ordinal - cfg.context_neighbours)
+            hi = min(len(siblings), chunk.ordinal + cfg.context_neighbours + 1)
+            members = siblings[lo:hi]
+        groups.append({
+            "doc_id": c.doc_id,
+            "start": min(m.start_char for m in members),
+            "end": max(m.end_char for m in members),
+            "chunk_ids": [m.chunk_id for m in members],
+            "priority": priority,
+            "scores": _scores_of(c),
+        })
+    return groups
+
+
+def _merge(groups: list[dict]) -> list[dict]:
+    """Union overlapping or touching spans within a document."""
+    out: list[dict] = []
+    for g in sorted(groups, key=lambda g: (g["doc_id"], g["start"], g["end"])):
+        prev = out[-1] if out else None
+        if prev and prev["doc_id"] == g["doc_id"] and g["start"] <= prev["end"]:
+            prev["end"] = max(prev["end"], g["end"])
+            prev["chunk_ids"] = list(dict.fromkeys(prev["chunk_ids"] + g["chunk_ids"]))
+            prev["priority"] = min(prev["priority"], g["priority"])
+            prev["scores"] = _best_scores(prev["scores"], g["scores"])
+        else:
+            out.append(dict(g))
+    return out
+
+
+def _order_blocks(blocks: list[ContextBlock], cfg: Config) -> list[ContextBlock]:
+    if cfg.context_order == "score_desc":
+        return blocks                                    # already in priority order
+    if cfg.context_order == "doc_order":
+        return sorted(blocks, key=lambda b: (b.doc_id, b.start_char))
+    if cfg.context_order == "inverted_v":
+        front, back = [], []                             # strongest at both ends
+        for i, b in enumerate(blocks):
+            (front if i % 2 == 0 else back).append(b)
+        return front + back[::-1]
+    raise SystemExit(f"unknown context.order {cfg.context_order!r}; "
+                     f"known: ['score_desc', 'doc_order', 'inverted_v']")
+
 
 def build_context(candidates: list[Candidate], index: Index, cfg: Config = CFG) -> Context:
-    raise NotImplementedError("stage 5: context construction")
+    if cfg.context_mmr not in SELECTORS:
+        raise SystemExit(f"unknown context.mmr {cfg.context_mmr!r}; known: {sorted(SELECTORS)}")
+    dropped: list[tuple[str, str]] = []
+
+    kept = _dedup(candidates, index, cfg, dropped)
+    selected = SELECTORS[cfg.context_mmr](kept, index, cfg)
+    chosen = {c.chunk_id for c in selected}
+    dropped.extend((c.chunk_id, "top_n") for c in kept if c.chunk_id not in chosen)
+
+    count_tokens = make_embedder(cfg).count_tokens
+    blocks: list[ContextBlock] = []
+    total = 0
+    for g in sorted(_merge(_expand(selected, index, cfg)), key=lambda g: g["priority"]):
+        doc = index.get_doc(g["doc_id"])
+        start, end = g["start"], g["end"]
+        n = count_tokens(doc.text[start:end])
+        if total + n > cfg.context_budget_tokens:
+            if blocks:
+                dropped.extend((cid, "budget") for cid in g["chunk_ids"])
+                continue
+            # the top block alone busts the budget: truncate rather than return an
+            # empty context, and keep the span honest about what was kept
+            tok = _memo_counter(doc.text, count_tokens)
+            end = _fit_end(start, end, cfg.context_budget_tokens, tok)
+            n = tok((start, end))
+            dropped.extend((cid, "budget_truncated") for cid in g["chunk_ids"])
+        blocks.append(ContextBlock(
+            block_id=0,
+            doc_id=doc.doc_id,
+            source_path=doc.source_path,
+            title=doc.title,
+            text=doc.text[start:end],
+            start_char=start,
+            end_char=end,
+            chunk_ids=g["chunk_ids"],
+            scores=g["scores"],
+        ))
+        total += n
+
+    blocks = _order_blocks(blocks, cfg)
+    for i, b in enumerate(blocks, 1):
+        b.block_id = i
+    return Context(blocks=blocks, total_tokens=total, dropped=dropped,
+                   index_hash=index.index_hash)
 
 
-def assemble_prompt(query: str, context: Context, cfg: Config = CFG) -> PromptBundle:
-    raise NotImplementedError("stage 6: prompt assembly")
+# --------------------------------------------------------------------------
+# stage 6: prompt assembly
+# --------------------------------------------------------------------------
+# Templates are versioned functions in this file, so two runs are comparable and
+# a template change is a diff. Config and retrieval scores stay out of the text
+# unless prompt.show_scores asks for them.
 
+def _block_meta(b: ContextBlock, cfg: Config) -> dict[str, str]:
+    meta: dict[str, str] = {"id": str(b.block_id)}
+    if cfg.prompt_metadata not in ("none", "source", "full"):
+        raise SystemExit(f"unknown prompt.metadata {cfg.prompt_metadata!r}; "
+                         f"known: ['none', 'source', 'full']")
+    if cfg.prompt_metadata in ("source", "full"):
+        meta["source"] = b.doc_id            # corpus-relative, not a local path
+    if cfg.prompt_metadata == "full":
+        meta["title"] = b.title
+        meta["span"] = f"{b.start_char}-{b.end_char}"
+    if cfg.prompt_show_scores:
+        best = max((v for v in b.scores.values() if v is not None), default=None)
+        if best is not None:
+            meta["score"] = f"{best:.4f}"
+    return meta
+
+
+def _render_block(b: ContextBlock, cfg: Config) -> str:
+    meta = _block_meta(b, cfg)
+    if cfg.prompt_delimiters == "xml":
+        attrs = " ".join(f'{k}="{v}"' for k, v in meta.items())
+        body = b.text.replace("</excerpt>", "<\\/excerpt>")   # never break the framing
+        return f"<excerpt {attrs}>\n{body}\n</excerpt>"
+    if cfg.prompt_delimiters == "markdown":
+        head = " · ".join(f"{k}: {v}" for k, v in meta.items())
+        return f"### Excerpt {meta['id']}\n{head}\n\n{b.text}"
+    if cfg.prompt_delimiters == "plain":
+        head = " | ".join(f"{k}: {v}" for k, v in meta.items())
+        return f"[{meta['id']}] {head}\n{b.text}\n" + "-" * 40
+    raise SystemExit(f"unknown prompt.delimiters {cfg.prompt_delimiters!r}; "
+                     f"known: ['xml', 'markdown', 'plain']")
+
+
+def _prompt_v0(query: str, context: Context, cfg: Config) -> str:
+    question = f"<question>\n{query}\n</question>" if cfg.prompt_delimiters == "xml" \
+        else f"Question: {query}"
+    excerpts = "\n\n".join(_render_block(b, cfg) for b in context.blocks)
+    instruction = (
+        "Answer the question using only the excerpts above. Cite the excerpt ids you "
+        "used, like [2]. If the excerpts do not contain the answer, say so plainly "
+        "instead of guessing."
+    )
+    parts = ["Below are excerpts retrieved from a document collection."]
+    if cfg.prompt_question_position in ("first", "both"):
+        parts.append(question)
+    parts.append(excerpts)
+    parts.append(instruction)
+    if cfg.prompt_question_position in ("last", "both"):
+        parts.append(question)
+    if cfg.prompt_question_position not in ("first", "last", "both"):
+        raise SystemExit(f"unknown prompt.question_position {cfg.prompt_question_position!r}; "
+                         f"known: ['first', 'last', 'both']")
+    return "\n\n".join(parts) + "\n"
+
+
+PROMPT_TEMPLATES: dict[str, Callable[[str, Context, Config], str]] = {
+    "v0": _prompt_v0,
+}
+
+
+def assemble_prompt(query: str, context: Context, cfg: Config = CFG,
+                    query_id: Optional[str] = None) -> PromptBundle:
+    if cfg.prompt_template not in PROMPT_TEMPLATES:
+        raise SystemExit(f"unknown prompt.template {cfg.prompt_template!r}; "
+                         f"known: {sorted(PROMPT_TEMPLATES)}")
+    text = PROMPT_TEMPLATES[cfg.prompt_template](query, context, cfg)
+    return PromptBundle(
+        text=text,
+        n_tokens=make_embedder(cfg).count_tokens(text),
+        query_id=query_id or hashlib.sha256(query.encode("utf-8")).hexdigest()[:8],
+        query=query,
+        block_ids=[b.block_id for b in context.blocks],
+        index_hash=context.index_hash,
+        config_hash=config_hash(cfg),
+    )
+
+
+# --------------------------------------------------------------------------
+# stage 7: manual generation, not written yet
+# --------------------------------------------------------------------------
 
 def deliver_prompt(bundle: PromptBundle, cfg: Config = CFG) -> None:
     """Clipboard + status line. Never calls a generation API; nothing here ever will."""
@@ -959,6 +1231,40 @@ def _cmd_inspect(args) -> None:
         print(f"{'':>27}  {preview!r}")
 
 
+def _pipeline(query: str, index: Index) -> tuple[PromptBundle, Context, list[Candidate], dict]:
+    timing = {}
+    t = time.time()
+    rewrites = rewrite_query(query, CFG)
+    timing["rewrite_ms"] = round((time.time() - t) * 1000, 1)
+    t = time.time()
+    candidates = retrieve(rewrites, index, CFG)
+    timing["retrieve_ms"] = round((time.time() - t) * 1000, 1)
+    t = time.time()
+    candidates = rerank(query, rewrites, candidates, index, CFG)
+    timing["rerank_ms"] = round((time.time() - t) * 1000, 1)
+    t = time.time()
+    context = build_context(candidates, index, CFG)
+    timing["context_ms"] = round((time.time() - t) * 1000, 1)
+    t = time.time()
+    bundle = assemble_prompt(query, context, CFG)
+    timing["prompt_ms"] = round((time.time() - t) * 1000, 1)
+    return bundle, context, candidates, timing
+
+
+def _cmd_query(args) -> None:
+    index = load_index(CFG)
+    bundle, context, candidates, timing = _pipeline(args.query, index)
+    print(bundle.text)                      # stdout is the prompt and nothing else
+    reasons: dict[str, int] = {}
+    for _, why in context.dropped:
+        reasons[why] = reasons.get(why, 0) + 1
+    print(f"query {bundle.query_id} | {len(candidates)} candidates -> {len(context.blocks)} blocks "
+          f"| {context.total_tokens} context tokens, {bundle.n_tokens} prompt tokens "
+          f"(budget {CFG.context_budget_tokens}) | dropped {reasons or '{}'} | "
+          f"{' '.join(f'{k}={v}' for k, v in timing.items())} | index {bundle.index_hash[:12]} "
+          f"| config {bundle.config_hash[:12]}", file=sys.stderr)
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -975,6 +1281,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_ins.add_argument("query")
     p_ins.add_argument("-n", type=int, default=20, help="how many candidates to print")
     p_ins.set_defaults(func=_cmd_inspect)
+
+    p_q = sub.add_parser("query", help="full pipeline; the prompt goes to stdout")
+    p_q.add_argument("query")
+    p_q.set_defaults(func=_cmd_query)
 
     args = ap.parse_args(argv)
     args.func(args)
