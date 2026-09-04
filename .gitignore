@@ -1,0 +1,9 @@
+# built artefacts: an index dir is large and reproducible from config + corpus
+indexes/
+runs/
+
+# your own documents stay out of git
+corpus/
+
+__pycache__/
+*.pyc
