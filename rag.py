@@ -7,6 +7,8 @@ is addition, not signature change.
 Implemented so far:
   stage 1  build_index / chunk_document
   stage 2  rewrite_query
+  stage 3  retrieve
+  stage 4  rerank
 
 Retrieval is local and generation is manual: nothing in this file may ever call
 a generation API.
@@ -70,6 +72,11 @@ class Config:
     retrieve_top_k: int = 20
 
     rerank_mode: str = "off"
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_revision: str = "main"
+    rerank_query: str = "original"   # original | rewrite0 | each
+    rerank_depth: int = 100          # how many candidates get scored, not how many survive
+    rerank_batch_size: int = 32
 
     context_top_n: int = 8
     context_budget_tokens: int = 6000
@@ -259,17 +266,24 @@ EMBEDDERS: dict[str, Callable[[Config], SentenceTransformerAdapter]] = {
 }
 
 
+_ADAPTERS: dict[tuple, object] = {}     # keep loaded models across queries in one process
+
+
 def make_embedder(cfg: Config):
     if cfg.embed_model not in EMBEDDERS:
         raise SystemExit(
             f"unknown embed.model {cfg.embed_model!r}; "
             f"known: {sorted(EMBEDDERS)} (add an entry to EMBEDDERS)"
         )
-    return EMBEDDERS[cfg.embed_model](cfg)
+    key = ("embed", cfg.embed_model, cfg.embed_revision, cfg.embed_prefix_scheme,
+           cfg.embed_dim, cfg.embed_batch_size, cfg.embed_normalize, cfg.device)
+    if key not in _ADAPTERS:
+        _ADAPTERS[key] = EMBEDDERS[cfg.embed_model](cfg)
+    return _ADAPTERS[key]
 
 
-def embed_text(chunk: Chunk) -> str:
-    """What actually gets embedded. Prefixes are the adapter's business."""
+def composed_text(chunk: Chunk) -> str:
+    """The chunk as a model sees it. Prefixes stay the adapter's business."""
     return chunk.text if not chunk.header else f"{chunk.header}\n\n{chunk.text}"
 
 
@@ -605,7 +619,7 @@ def build_index(cfg: Config = CFG, rebuild: bool = False, verbose: bool = True) 
     t_embed = time.time()
     for start in range(0, len(chunks), slice_size):
         batch = chunks[start:start + slice_size]
-        vecs[start:start + len(batch)] = adapter.encode_documents([embed_text(c) for c in batch])
+        vecs[start:start + len(batch)] = adapter.encode_documents([composed_text(c) for c in batch])
         if verbose:
             done = start + len(batch)
             rate = done / max(time.time() - t_embed, 1e-6)
@@ -710,17 +724,168 @@ def rewrite_query(query: str, cfg: Config = CFG) -> list[Rewrite]:
 
 
 # --------------------------------------------------------------------------
-# stages 3-7: names and signatures locked, bodies not written yet
+# stage 3: embedding & retrieval
 # --------------------------------------------------------------------------
+# Brute-force numpy over the whole matrix. No ANN index: at 50k x 384 a full
+# scan is single-digit milliseconds, and query latency here is human-scale.
+
+def _cosine_scores(index: Index, qvecs: np.ndarray) -> np.ndarray:
+    """[n_rewrites, n_chunks]. How vectors are compared stays inside the retriever."""
+    scores = qvecs @ index.matrix.T
+    if not index.meta.get("normalized", True):
+        qn = np.linalg.norm(qvecs, axis=1, keepdims=True)
+        dn = np.linalg.norm(index.matrix, axis=1)[None, :]
+        scores = scores / np.maximum(qn * dn, 1e-12)
+    return np.asarray(scores, dtype=np.float32)
+
+
+def _retrieve_dense(rewrites: list[Rewrite], index: Index, cfg: Config) -> list[Candidate]:
+    if not index.chunks:
+        return []
+    adapter = make_embedder(cfg)
+    scores = _cosine_scores(index, adapter.encode_queries([r.text for r in rewrites]))
+    k = max(1, min(cfg.retrieve_top_k, len(index.chunks)))
+
+    merged: dict[str, Candidate] = {}
+    for row, rw in zip(scores, rewrites):
+        top = np.argpartition(-row, k - 1)[:k]
+        top = top[np.argsort(-row[top], kind="stable")]
+        for rank, i in enumerate(top, 1):          # 1-based: RRF wants it that way
+            chunk = index.chunks[int(i)]
+            cand = merged.get(chunk.chunk_id)
+            if cand is None:
+                cand = Candidate(chunk_id=chunk.chunk_id, doc_id=chunk.doc_id)
+                merged[chunk.chunk_id] = cand
+            score = float(row[int(i)])
+            # accumulate, never overwrite: a chunk surfaced by two rewrites keeps
+            # its best dense score and the provenance of both
+            cand.dense_score = score if cand.dense_score is None else max(cand.dense_score, score)
+            if "dense" not in cand.retrievers:
+                cand.retrievers.append("dense")
+            if rw.rewrite_id not in cand.rewrite_ids:
+                cand.rewrite_ids.append(rw.rewrite_id)
+            cand.ranks[f"dense@rw{rw.rewrite_id}"] = rank
+    return sorted(merged.values(), key=lambda c: (-(c.dense_score or 0.0), c.chunk_id))
+
+
+RETRIEVERS: dict[str, Callable[[list[Rewrite], Index, Config], list[Candidate]]] = {
+    "dense": _retrieve_dense,
+}
+
 
 def retrieve(rewrites: list[Rewrite], index: Index, cfg: Config = CFG) -> list[Candidate]:
-    raise NotImplementedError("stage 3: embedding & retrieval")
+    """retrieve.top_k is depth *per rewrite*; the merged pool is returned whole."""
+    if cfg.retrieve_mode not in RETRIEVERS:
+        raise SystemExit(f"unknown retrieve.mode {cfg.retrieve_mode!r}; known: {sorted(RETRIEVERS)}")
+    return RETRIEVERS[cfg.retrieve_mode](rewrites, index, cfg)
 
 
-def rerank(query: str, candidates: list[Candidate], cfg: Config = CFG) -> list[Candidate]:
-    """Scores every candidate and returns every candidate; truncation is stage 5."""
-    raise NotImplementedError("stage 4: reranking")
+# --------------------------------------------------------------------------
+# stage 4: reranking
+# --------------------------------------------------------------------------
+# Scores candidates and reorders them. It never drops one: keeping the demoted
+# tail is what lets you ask whether a reranker pushed a gold chunk out of the
+# context, which is the whole reason to measure a reranker separately.
 
+class CrossEncoderAdapter:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._model = None
+
+    @property
+    def model(self):
+        if self._model is None:
+            from sentence_transformers import CrossEncoder
+            self._model = CrossEncoder(
+                self.cfg.rerank_model,
+                revision=self.cfg.rerank_revision,
+                device=self.cfg.device,
+            )
+        return self._model
+
+    def score(self, pairs: list[tuple[str, str]]) -> list[float]:
+        if not pairs:
+            return []
+        out = self.model.predict(pairs, batch_size=self.cfg.rerank_batch_size,
+                                 show_progress_bar=False, convert_to_numpy=True)
+        return [float(x) for x in np.asarray(out).reshape(-1)]
+
+
+RERANKER_ADAPTERS: dict[str, Callable[[Config], CrossEncoderAdapter]] = {
+    "cross-encoder/ms-marco-MiniLM-L-6-v2": CrossEncoderAdapter,
+    "cross-encoder/ms-marco-MiniLM-L-12-v2": CrossEncoderAdapter,
+    "BAAI/bge-reranker-base": CrossEncoderAdapter,
+}
+
+
+def make_reranker(cfg: Config) -> CrossEncoderAdapter:
+    if cfg.rerank_model not in RERANKER_ADAPTERS:
+        raise SystemExit(
+            f"unknown rerank.model {cfg.rerank_model!r}; "
+            f"known: {sorted(RERANKER_ADAPTERS)} (add an entry to RERANKER_ADAPTERS)"
+        )
+    key = ("rerank", cfg.rerank_model, cfg.rerank_revision, cfg.rerank_batch_size, cfg.device)
+    if key not in _ADAPTERS:
+        _ADAPTERS[key] = RERANKER_ADAPTERS[cfg.rerank_model](cfg)
+    return _ADAPTERS[key]
+
+
+def _rerank_query_texts(query: str, rewrites: list[Rewrite], cfg: Config) -> list[str]:
+    """Which query the reranker scores against -- an ablation axis in its own right."""
+    if cfg.rerank_query == "original":
+        return [query]
+    if cfg.rerank_query == "rewrite0":
+        return [rewrites[0].text]
+    if cfg.rerank_query == "each":
+        return [r.text for r in rewrites]
+    raise SystemExit(f"unknown rerank.query {cfg.rerank_query!r}; "
+                     f"known: ['original', 'rewrite0', 'each']")
+
+
+def _rerank_off(query: str, rewrites: list[Rewrite], candidates: list[Candidate],
+                index: Index, cfg: Config) -> list[Candidate]:
+    return candidates
+
+
+def _rerank_cross_encoder(query: str, rewrites: list[Rewrite], candidates: list[Candidate],
+                          index: Index, cfg: Config) -> list[Candidate]:
+    if not candidates:
+        return candidates
+    depth = max(0, cfg.rerank_depth)
+    head, tail = candidates[:depth], candidates[depth:]
+    if not head:
+        return candidates
+
+    adapter = make_reranker(cfg)
+    queries = _rerank_query_texts(query, rewrites, cfg)
+    docs = [composed_text(index.get_chunk(c.chunk_id)) for c in head]
+    per_query = [adapter.score([(q, d) for d in docs]) for q in queries]
+    for i, cand in enumerate(head):
+        cand.rerank_score = max(scores[i] for scores in per_query)
+
+    head = sorted(head, key=lambda c: (-(c.rerank_score or 0.0), c.chunk_id))
+    # the unscored tail is retained, after the scored head, in its prior order
+    return head + tail
+
+
+RERANKERS: dict[str, Callable[..., list[Candidate]]] = {
+    "off": _rerank_off,
+    "cross_encoder": _rerank_cross_encoder,
+}
+
+
+def rerank(query: str, rewrites: list[Rewrite], candidates: list[Candidate],
+           index: Index, cfg: Config = CFG) -> list[Candidate]:
+    """Sets rerank_score and reorders. Every candidate in, every candidate out;
+    keeping only the top n is stage 5's decision, made against a full list."""
+    if cfg.rerank_mode not in RERANKERS:
+        raise SystemExit(f"unknown rerank.mode {cfg.rerank_mode!r}; known: {sorted(RERANKERS)}")
+    return RERANKERS[cfg.rerank_mode](query, rewrites, candidates, index, cfg)
+
+
+# --------------------------------------------------------------------------
+# stages 5-7: names and signatures locked, bodies not written yet
+# --------------------------------------------------------------------------
 
 def build_context(candidates: list[Candidate], index: Index, cfg: Config = CFG) -> Context:
     raise NotImplementedError("stage 5: context construction")
@@ -764,6 +929,36 @@ def _cmd_rewrite(args) -> None:
         print(json.dumps(dataclasses.asdict(r), ensure_ascii=False))
 
 
+def _cmd_inspect(args) -> None:
+    index = load_index(CFG)
+    t0 = time.time()
+    rewrites = rewrite_query(args.query, CFG)
+    t1 = time.time()
+    candidates = retrieve(rewrites, index, CFG)
+    t2 = time.time()
+    candidates = rerank(args.query, rewrites, candidates, index, CFG)
+    t3 = time.time()
+
+    print(f"index    {index.index_hash[:12]}  {index.meta['n_chunks']} chunks "
+          f"from {index.meta['n_docs']} docs")
+    print(f"rewrite  {CFG.rewrite_mode}: {len(rewrites)} query/queries "
+          f"({(t1 - t0) * 1000:.0f} ms)")
+    for r in rewrites:
+        print(f"   rw{r.rewrite_id}  {r.text!r}")
+    print(f"retrieve {CFG.retrieve_mode} top_k={CFG.retrieve_top_k} -> {len(candidates)} candidates "
+          f"({(t2 - t1) * 1000:.0f} ms)")
+    print(f"rerank   {CFG.rerank_mode} ({(t3 - t2) * 1000:.0f} ms)")
+    print(f"{'#':>3}  {'dense':>7}  {'rerank':>8}  {'rw':>4}  chunk")
+    for n, c in enumerate(candidates[:args.n], 1):
+        chunk = index.get_chunk(c.chunk_id)
+        preview = " ".join(chunk.text.split())[:72]
+        print(f"{n:>3}  {c.dense_score if c.dense_score is None else round(c.dense_score, 4):>7}  "
+              f"{c.rerank_score if c.rerank_score is None else round(c.rerank_score, 4):>8}  "
+              f"{','.join(str(i) for i in c.rewrite_ids):>4}  "
+              f"{c.doc_id}:{chunk.start_char}-{chunk.end_char}")
+        print(f"{'':>27}  {preview!r}")
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -775,6 +970,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_rw = sub.add_parser("rewrite", help="show the rewrite list for a query")
     p_rw.add_argument("query")
     p_rw.set_defaults(func=_cmd_rewrite)
+
+    p_ins = sub.add_parser("inspect", help="rewrite -> retrieve -> rerank, with scores")
+    p_ins.add_argument("query")
+    p_ins.add_argument("-n", type=int, default=20, help="how many candidates to print")
+    p_ins.set_defaults(func=_cmd_inspect)
 
     args = ap.parse_args(argv)
     args.func(args)
